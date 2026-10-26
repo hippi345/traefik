@@ -249,6 +249,13 @@ func (r *retry) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	err := backoff.RetryNotify(operation, backOff, notify)
 	if err != nil {
 		logger.Debug().Err(err).Msg("Final retry attempt failed")
+
+		// backoff.WithContext returns as soon as the request context is done, which
+		// can be before the last attempt. Only that attempt writes to the downstream
+		// writer. Skipping it leaves buffering to flush an unset status: HTTP/2
+		// panics on WriteHeader(0), and a default of 200 is an empty success.
+		attempts = r.attempts
+		_ = operation()
 	}
 
 	if currentSpan != nil {
