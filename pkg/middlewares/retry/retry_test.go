@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,8 @@ import (
 	"github.com/stretchr/testify/require"
 	ptypes "github.com/traefik/paerser/types"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares/buffering"
+	proxyhttputil "github.com/traefik/traefik/v3/pkg/proxy/httputil"
 	"github.com/traefik/traefik/v3/pkg/testhelpers"
 )
 
@@ -274,6 +277,53 @@ func TestRetryOnStatusWhenProxyNotReached(t *testing.T) {
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.Equal(t, 2, callCount)
 	assert.Equal(t, 1, retryListener.timesCalled)
+}
+
+func TestRetryCanceledContextWithBuffering(t *testing.T) {
+	// Client cancellation before retry runs makes every non-final attempt discard
+	// the proxy's 499 as a network error, and the back-off then stops before the
+	// attempt that writes downstream. Buffering flushes that unset status. net/http
+	// panics on WriteHeader(0); the recorder below applies the same check.
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		proxyhttputil.ErrorHandler(rw, req, req.Context().Err())
+	})
+
+	retryHandler, err := New(t.Context(), WrapHandler(next), dynamic.Retry{Attempts: 3}, &countingRetryListener{}, "retry")
+	require.NoError(t, err)
+
+	handler, err := buffering.New(t.Context(), retryHandler, dynamic.Buffering{
+		MaxResponseBodyBytes: 128 * 1024,
+	}, "buffer")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	recorder := &statusCheckingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := testhelpers.MustNewRequest(http.MethodGet, "http://localhost/buf-retry", http.NoBody).WithContext(ctx)
+
+	require.NotPanics(t, func() {
+		handler.ServeHTTP(recorder, req)
+	})
+	assert.Equal(t, proxyhttputil.StatusClientClosedRequest, recorder.Code)
+}
+
+// statusCheckingRecorder applies the same status-code check as net/http, which
+// panics on WriteHeader(0). httptest.ResponseRecorder accepts that code.
+type statusCheckingRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (r *statusCheckingRecorder) WriteHeader(code int) {
+	if code < 100 || code > 999 {
+		panic(fmt.Sprintf("invalid WriteHeader code %v", code))
+	}
+
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func (r *statusCheckingRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseRecorder
 }
 
 func TestRetryWithFlush(t *testing.T) {
